@@ -1,12 +1,13 @@
 const express = require('express');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
-const Datastore = require('nedb');
 const path = require('path');
 
 const app = express();
-const users = new Datastore({ filename: 'users.db', autoload: true });
-const notes = new Datastore({ filename: 'notes.db', autoload: true });
+
+// In-memory database
+const users = {};
+const notes = {};
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -14,12 +15,13 @@ app.use(express.static('public'));
 app.use(session({
   secret: 'notenest-secret-2024',
   resave: false,
-  saveUninitialized: false
+  saveUninitialized: false,
+  cookie: { maxAge: 7 * 24 * 60 * 60 * 1000 }
 }));
 
 function requireLogin(req, res, next) {
   if (req.session.userId) return next();
-  res.redirect('/');
+  res.status(401).json({ error: 'Login করো' });
 }
 
 // Register
@@ -27,29 +29,27 @@ app.post('/register', (req, res) => {
   const { username, password } = req.body;
   if (!username || !password)
     return res.json({ error: 'সব তথ্য দাও' });
-
-  users.findOne({ username }, (err, user) => {
-    if (user) return res.json({ error: 'এই নাম আগেই নেওয়া হয়েছে' });
-    const hash = bcrypt.hashSync(password, 10);
-    users.insert({ username, password: hash }, (err, newUser) => {
-      req.session.userId = newUser._id;
-      req.session.username = newUser.username;
-      res.json({ success: true });
-    });
-  });
+  if (users[username])
+    return res.json({ error: 'এই নাম আগেই নেওয়া হয়েছে' });
+  const hash = bcrypt.hashSync(password, 10);
+  users[username] = { username, password: hash };
+  notes[username] = [];
+  req.session.userId = username;
+  req.session.username = username;
+  res.json({ success: true });
 });
 
 // Login
 app.post('/login', (req, res) => {
   const { username, password } = req.body;
-  users.findOne({ username }, (err, user) => {
-    if (!user) return res.json({ error: 'ব্যবহারকারী পাওয়া যায়নি' });
-    if (!bcrypt.compareSync(password, user.password))
-      return res.json({ error: 'পাসওয়ার্ড ভুল' });
-    req.session.userId = user._id;
-    req.session.username = user.username;
-    res.json({ success: true });
-  });
+  const user = users[username];
+  if (!user)
+    return res.json({ error: 'ব্যবহারকারী পাওয়া যায়নি' });
+  if (!bcrypt.compareSync(password, user.password))
+    return res.json({ error: 'পাসওয়ার্ড ভুল' });
+  req.session.userId = username;
+  req.session.username = username;
+  res.json({ success: true });
 });
 
 // Logout
@@ -60,37 +60,40 @@ app.post('/logout', (req, res) => {
 
 // Get notes
 app.get('/api/notes', requireLogin, (req, res) => {
-  notes.find({ userId: req.session.userId }).sort({ date: -1 }).exec((err, docs) => {
-    res.json(docs);
-  });
+  const userNotes = notes[req.session.userId] || [];
+  res.json([...userNotes].reverse());
 });
 
 // Create note
 app.post('/api/notes', requireLogin, (req, res) => {
   const { title, body, color } = req.body;
-  notes.insert({
-    userId: req.session.userId,
+  const note = {
+    _id: Date.now().toString(),
     title, body, color,
     date: new Date().toISOString()
-  }, (err, doc) => res.json(doc));
+  };
+  if (!notes[req.session.userId]) notes[req.session.userId] = [];
+  notes[req.session.userId].push(note);
+  res.json(note);
 });
 
 // Update note
 app.put('/api/notes/:id', requireLogin, (req, res) => {
   const { title, body, color } = req.body;
-  notes.update(
-    { _id: req.params.id, userId: req.session.userId },
-    { $set: { title, body, color } },
-    {},
-    (err) => res.json({ success: true })
-  );
+  const userNotes = notes[req.session.userId] || [];
+  const idx = userNotes.findIndex(n => n._id === req.params.id);
+  if (idx !== -1) {
+    userNotes[idx] = { ...userNotes[idx], title, body, color };
+  }
+  res.json({ success: true });
 });
 
 // Delete note
 app.delete('/api/notes/:id', requireLogin, (req, res) => {
-  notes.remove({ _id: req.params.id, userId: req.session.userId }, {}, () => {
-    res.json({ success: true });
-  });
+  if (notes[req.session.userId]) {
+    notes[req.session.userId] = notes[req.session.userId].filter(n => n._id !== req.params.id);
+  }
+  res.json({ success: true });
 });
 
 // Session check
