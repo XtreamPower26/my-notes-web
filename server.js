@@ -1,29 +1,34 @@
 const express = require('express');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
-const { MongoClient, ObjectId } = require('mongodb');
+const { Pool } = require('pg');
 
 const app = express();
 
-const MONGO_URL = process.env.MONGO_URL || '';
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
-let db, users, notes;
-
-async function connectDB() {
-  try {
-    const client = new MongoClient(MONGO_URL, {
-      serverSelectionTimeoutMS: 10000,
-      connectTimeoutMS: 10000,
-    });
-    await client.connect();
-    db = client.db('shifatdb');
-    users = db.collection('users');
-    notes = db.collection('notes');
-    console.log('✅ MongoDB connected!');
-  } catch(err) {
-    console.error('❌ MongoDB error:', err.message);
-    process.exit(1);
-  }
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username VARCHAR(100) UNIQUE NOT NULL,
+      password VARCHAR(255) NOT NULL
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notes (
+      id SERIAL PRIMARY KEY,
+      user_id VARCHAR(100) NOT NULL,
+      title VARCHAR(255),
+      body TEXT,
+      color VARCHAR(50),
+      date TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  console.log('✅ Database ready!');
 }
 
 app.use(express.json());
@@ -46,33 +51,33 @@ app.post('/register', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password)
       return res.json({ error: 'সব তথ্য দাও' });
-    const existing = await users.findOne({ username });
-    if (existing)
+    const existing = await pool.query('SELECT * FROM users WHERE username=$1', [username]);
+    if (existing.rows.length > 0)
       return res.json({ error: 'এই নাম আগেই নেওয়া হয়েছে' });
     const hash = bcrypt.hashSync(password, 10);
-    await users.insertOne({ username, password: hash });
+    await pool.query('INSERT INTO users (username, password) VALUES ($1, $2)', [username, hash]);
     req.session.userId = username;
     req.session.username = username;
     res.json({ success: true });
   } catch(err) {
-    console.error(err);
-    res.json({ error: 'সার্ভার সমস্যা: ' + err.message });
+    res.json({ error: 'সমস্যা: ' + err.message });
   }
 });
 
 app.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    const user = await users.findOne({ username });
-    if (!user)
+    const result = await pool.query('SELECT * FROM users WHERE username=$1', [username]);
+    if (result.rows.length === 0)
       return res.json({ error: 'ব্যবহারকারী পাওয়া যায়নি' });
+    const user = result.rows[0];
     if (!bcrypt.compareSync(password, user.password))
       return res.json({ error: 'পাসওয়ার্ড ভুল' });
     req.session.userId = username;
     req.session.username = username;
     res.json({ success: true });
   } catch(err) {
-    res.json({ error: 'সার্ভার সমস্যা: ' + err.message });
+    res.json({ error: 'সমস্যা: ' + err.message });
   }
 });
 
@@ -83,8 +88,17 @@ app.post('/logout', (req, res) => {
 
 app.get('/api/notes', requireLogin, async (req, res) => {
   try {
-    const userNotes = await notes.find({ userId: req.session.userId }).sort({ date: -1 }).toArray();
-    res.json(userNotes);
+    const result = await pool.query(
+      'SELECT * FROM notes WHERE user_id=$1 ORDER BY date DESC',
+      [req.session.userId]
+    );
+    res.json(result.rows.map(n => ({
+      _id: n.id.toString(),
+      title: n.title,
+      body: n.body,
+      color: n.color,
+      date: n.date
+    })));
   } catch(err) {
     res.json([]);
   }
@@ -93,13 +107,12 @@ app.get('/api/notes', requireLogin, async (req, res) => {
 app.post('/api/notes', requireLogin, async (req, res) => {
   try {
     const { title, body, color } = req.body;
-    const note = {
-      userId: req.session.userId,
-      title, body, color,
-      date: new Date().toISOString()
-    };
-    const result = await notes.insertOne(note);
-    res.json({ ...note, _id: result.insertedId });
+    const result = await pool.query(
+      'INSERT INTO notes (user_id, title, body, color) VALUES ($1, $2, $3, $4) RETURNING *',
+      [req.session.userId, title, body, color]
+    );
+    const n = result.rows[0];
+    res.json({ _id: n.id.toString(), title: n.title, body: n.body, color: n.color, date: n.date });
   } catch(err) {
     res.json({ error: err.message });
   }
@@ -108,9 +121,9 @@ app.post('/api/notes', requireLogin, async (req, res) => {
 app.put('/api/notes/:id', requireLogin, async (req, res) => {
   try {
     const { title, body, color } = req.body;
-    await notes.updateOne(
-      { _id: new ObjectId(req.params.id), userId: req.session.userId },
-      { $set: { title, body, color } }
+    await pool.query(
+      'UPDATE notes SET title=$1, body=$2, color=$3 WHERE id=$4 AND user_id=$5',
+      [title, body, color, req.params.id, req.session.userId]
     );
     res.json({ success: true });
   } catch(err) {
@@ -120,10 +133,10 @@ app.put('/api/notes/:id', requireLogin, async (req, res) => {
 
 app.delete('/api/notes/:id', requireLogin, async (req, res) => {
   try {
-    await notes.deleteOne({
-      _id: new ObjectId(req.params.id),
-      userId: req.session.userId
-    });
+    await pool.query(
+      'DELETE FROM notes WHERE id=$1 AND user_id=$2',
+      [req.params.id, req.session.userId]
+    );
     res.json({ success: true });
   } catch(err) {
     res.json({ error: err.message });
@@ -138,6 +151,6 @@ app.get('/api/me', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-connectDB().then(() => {
-  app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+initDB().then(() => {
+  app.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
 });
